@@ -10,6 +10,7 @@ and domain knowledge on demand.
 import json
 import os
 import re
+from enum import Enum
 from typing import Optional
 
 import anthropic
@@ -32,7 +33,14 @@ if not ANTHROPIC_API_KEY:
     raise RuntimeError("ANTHROPIC_API_KEY not set. Add it to .env file.")
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-DEFAULT_MODEL = "claude-3-7-sonnet-20250219"
+
+
+class AnthropicModel(str, Enum):
+    claude_sonnet_old = "claude-3-5-sonnet-20241022"
+    claude_sonnet_new = "claude-3-7-sonnet-20250219"
+
+
+DEFAULT_MODEL = AnthropicModel.claude_sonnet_new.value
 
 # ── SMK Engine (Layer 1 — static reference) ───────────────────────────
 
@@ -42,15 +50,16 @@ SYSTEM_PROMPT = smk.build_base_prompt()
 # ── Request/Response Models ───────────────────────────────────────────
 
 
-class ChatRequest(BaseModel):
+class CalendarRequest(BaseModel):
     message: str
     email: Optional[str] = None
     password: Optional[str] = None
     conversation_id: Optional[str] = None
+    provider: Optional[str] = None
     model: Optional[str] = None
 
 
-class ChatResponse(BaseModel):
+class CalendarResponse(BaseModel):
     response: str
     conversation_id: str
     completed: bool
@@ -219,17 +228,24 @@ async def root():
 
 @app.get("/models")
 async def list_models():
+    anthropic_models = [
+        {"name": m.value, "provider": "anthropic", "display_name": m.name.replace("_", " ").title()}
+        for m in AnthropicModel
+    ]
     return {
-        "default_model": DEFAULT_MODEL,
-        "models": [
-            {"name": "claude-3-5-sonnet-20241022", "provider": "anthropic"},
-            {"name": "claude-3-7-sonnet-20250219", "provider": "anthropic"},
-        ],
+        "providers": ["anthropic"],
+        "default_provider": "anthropic",
+        "default_model": {
+            "anthropic": DEFAULT_MODEL,
+        },
+        "models": {
+            "anthropic": anthropic_models,
+        },
     }
 
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+@app.post("/chat", response_model=CalendarResponse)
+async def chat(request: CalendarRequest):
     """Non-streaming chat — runs the full THINK/ACT/OBSERVE loop."""
     conversation_id = request.conversation_id or str(hash(request.message))
     model = request.model or DEFAULT_MODEL
@@ -271,7 +287,7 @@ async def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
-    return ChatResponse(
+    return CalendarResponse(
         response=final_response or "I wasn't able to complete the task.",
         conversation_id=conversation_id,
         completed=is_final,
@@ -279,7 +295,7 @@ async def chat(request: ChatRequest):
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
+async def chat_stream(request: CalendarRequest):
     """Streaming chat — emits think/act/observe events via SSE."""
 
     async def generate():
@@ -301,7 +317,7 @@ async def chat_stream(request: ChatRequest):
             user_message = f"My credentials are: email={request.email}, password={request.password}. {user_message}"
         messages.append({"role": "user", "content": user_message})
 
-        yield f"data: {json.dumps({'type': 'start', 'conversation_id': conversation_id, 'message': request.message})}\n\n"
+        yield f"data: {json.dumps({'type': 'start', 'conversation_id': conversation_id, 'message': request.message, 'provider': 'anthropic', 'model': model})}\n\n"
 
         iteration = 0
         max_iterations = 20
