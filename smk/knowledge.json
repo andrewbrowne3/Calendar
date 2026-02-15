@@ -1,0 +1,57 @@
+{
+  "model": "Knowledge",
+  "concepts": [
+    {
+      "name": "Calendar API",
+      "description": "RESTful API at http://localhost:2011 for managing calendars and events",
+      "properties": {
+        "base_url": "http://localhost:2011",
+        "auth_endpoint": "POST /api/auth/login/",
+        "calendars_endpoint": "GET /api/calendars/",
+        "events_endpoint": "GET /api/events/, POST /api/events/, PATCH /api/events/{id}/, DELETE /api/events/{id}/",
+        "auth_type": "JWT Bearer token in Authorization header"
+      }
+    },
+    {
+      "name": "Event",
+      "description": "A scheduled calendar entry with a time range",
+      "properties": {
+        "required_fields": ["calendar", "title", "start_time", "end_time"],
+        "optional_fields": ["description", "reminder_minutes"],
+        "datetime_format": "ISO 8601: YYYY-MM-DDTHH:MM:SSZ",
+        "reminder_format": "array of integer minutes before event start (e.g., [5, 15, 60])"
+      }
+    },
+    {
+      "name": "Relative Date Resolution",
+      "description": "Converting natural language dates like 'tomorrow' or 'next Friday' to ISO 8601",
+      "properties": {
+        "requires": "current datetime from get_current_datetime()",
+        "pattern": "Get current datetime first, then calculate offset"
+      }
+    },
+    {
+      "name": "Authentication Flow",
+      "description": "Login to get JWT token, then use token for all subsequent calls",
+      "properties": {
+        "step_1": "POST /api/auth/login/ with {email, password} → returns {access: token}",
+        "step_2": "Use token in header: Authorization: Bearer <token>",
+        "token_scope": "All calendar and event operations for authenticated user"
+      }
+    },
+    {
+      "name": "Available Tools",
+      "description": "Tools the agent can call in ACT steps",
+      "properties": {
+        "get_current_datetime()": "Returns current ISO 8601 datetime",
+        "login(email, password)": "Authenticates, returns JWT. Defaults: email=andrewbrowne161@gmail.com",
+        "get_calendars(token)": "Returns user's calendars (need calendar_id for events)",
+        "get_events(token)": "Returns all events for user",
+        "post_event(token, calendar_id, title, start_time, end_time, description, reminder_minutes)": "Creates new event",
+        "patch_event(token, event_id, title, start_time, end_time, description, reminder_minutes)": "Updates event fields (only sends changed fields)",
+        "delete_event(token, event_id)": "Deletes event by ID",
+        "final_answer(answer)": "Returns response to user, ends the loop"
+      }
+    }
+  ]
+}

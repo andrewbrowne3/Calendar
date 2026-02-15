@@ -1,434 +1,277 @@
+"""
+Calendar Agent API — SMK-structured version.
+
+SMK (Skills, Methods, Knowledge) replaces a hand-written system prompt
+with progressive disclosure: only skill names are loaded initially,
+then the agent calls load_skill_context() to get detailed procedures
+and domain knowledge on demand.
+"""
+
 import json
 import os
 import re
-from datetime import datetime
-from enum import Enum
-from typing import Optional, List
+from typing import Optional
 
 import anthropic
-import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="Calendar Agent API")
+from smk_engine import SMKEngine
+from tools.calendar_tools import TOOL_REGISTRY
 
-# Get API key from environment variable
+load_dotenv()
+
+app = FastAPI(title="Calendar Agent API (SMK)")
+
+# ── Configuration ──────────────────────────────────────────────────────
+
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
-# Ollama configuration
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+if not ANTHROPIC_API_KEY:
+    raise RuntimeError("ANTHROPIC_API_KEY not set. Add it to .env file.")
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+DEFAULT_MODEL = "claude-3-7-sonnet-20250219"
+
+# ── SMK Engine (Layer 1 — static reference) ───────────────────────────
+
+smk = SMKEngine(smk_dir="smk/")
+SYSTEM_PROMPT = smk.build_base_prompt()
+
+# ── Request/Response Models ───────────────────────────────────────────
 
 
-class Provider(str, Enum):
-    anthropic = "anthropic"
-    ollama = "ollama"
-
-
-class AnthropicModel(str, Enum):
-    claude_sonnet_old = "claude-3-5-sonnet-20241022"
-    claude_sonnet_new = "claude-3-7-sonnet-20250219"
-
-
-# Default settings
-DEFAULT_PROVIDER = Provider.anthropic
-DEFAULT_ANTHROPIC_MODEL = AnthropicModel.claude_sonnet_new
-DEFAULT_OLLAMA_MODEL = "llama3.2:latest"
-
-# Base URL for calendar API
-CALENDAR_API_BASE = "https://calendar.andrewbrowne.org"
-
-
-class CalendarRequest(BaseModel):
+class ChatRequest(BaseModel):
     message: str
     email: Optional[str] = None
     password: Optional[str] = None
     conversation_id: Optional[str] = None
-    provider: Optional[str] = None  # "anthropic" or "ollama"
-    model: Optional[str] = None  # specific model name
+    model: Optional[str] = None
 
 
-class CalendarResponse(BaseModel):
+class ChatResponse(BaseModel):
     response: str
     conversation_id: str
     completed: bool
 
 
-# In-memory storage for conversation history
+# ── In-memory state ───────────────────────────────────────────────────
+
 conversations = {}
 
-
-def get_ollama_models() -> List[dict]:
-    """Fetch available models from Ollama server"""
-    try:
-        response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        return data.get("models", [])
-    except requests.exceptions.RequestException:
-        return []
+# ── Tool Execution ────────────────────────────────────────────────────
 
 
-def call_ollama(model: str, messages: list, system_prompt: str = None) -> str:
-    """Call Ollama API and return the response text"""
-    # Convert messages to Ollama format
-    ollama_messages = []
-
-    # Add system prompt as first message if provided
-    if system_prompt:
-        ollama_messages.append({"role": "system", "content": system_prompt})
-
-    for msg in messages:
-        # Skip the first assistant message if it's the system prompt (old format)
-        if msg["role"] == "assistant" and msg["content"].startswith("You are a meticulous calendar"):
-            continue
-        ollama_messages.append({"role": msg["role"], "content": msg["content"]})
-
-    response = requests.post(
-        f"{OLLAMA_BASE_URL}/api/chat",
-        json={
-            "model": model,
-            "messages": ollama_messages,
-            "stream": False,
-        },
-        timeout=120,
-    )
-    response.raise_for_status()
-    return response.json()["message"]["content"]
+def _arg(name: str) -> str:
+    """Regex fragment matching both name='val' and 'val' (positional)."""
+    return rf'(?:{name}=)?["\'](.+?)["\']'
 
 
-def call_anthropic(model: str, messages: list) -> str:
-    """Call Anthropic API and return the response text"""
+def _opt_arg(name: str) -> str:
+    """Regex for optional named arg."""
+    return rf'(?:,\s*{name}=["\']([^"\']*)["\'])?'
+
+
+TOOL_PATTERNS = {
+    "load_skill_context": re.compile(rf'ACT:\s*load_skill_context\({_arg("skill_name")}\)'),
+    "get_current_datetime": re.compile(r'ACT:\s*get_current_datetime\(\)'),
+    "login": re.compile(
+        r'ACT:\s*login\('
+        r'(?:(?:email=)?["\']([^"\']+)["\']\s*'
+        r'(?:,\s*(?:password=)?(?:["\']([^"\']*)["\']|None)\s*)?'
+        r')?'
+        r'\)'
+    ),
+    "get_calendars": re.compile(rf'ACT:\s*get_calendars\({_arg("token")}\)'),
+    "get_events": re.compile(rf'ACT:\s*get_events\({_arg("token")}\)'),
+    "post_event": re.compile(
+        rf'ACT:\s*post_event\({_arg("token")}\s*,\s*{_arg("calendar_id")}\s*,'
+        rf'\s*{_arg("title")}\s*,\s*{_arg("start_time")}\s*,'
+        rf'\s*{_arg("end_time")}\s*'
+        rf'(?:\s*,\s*(?:description=)?["\']([^"\']*)["\'])?'
+        rf'(?:\s*,\s*(?:reminder_minutes=)?\[([^\]]*)\])?'
+        rf'\)'
+    ),
+    "patch_event": re.compile(
+        rf'ACT:\s*patch_event\({_arg("token")}\s*,\s*{_arg("event_id")}\s*'
+        rf'{_opt_arg("title")}\s*'
+        rf'{_opt_arg("start_time")}\s*'
+        rf'{_opt_arg("end_time")}\s*'
+        rf'{_opt_arg("description")}\s*'
+        rf'(?:,\s*reminder_minutes=\[([^\]]*)\])?\)'
+    ),
+    "delete_event": re.compile(
+        rf'ACT:\s*delete_event\({_arg("token")}\s*,\s*{_arg("event_id")}\)'
+    ),
+    "final_answer": re.compile(r'ACT:\s*final_answer\((?:answer=)?["\'](.+?)["\']\)', re.DOTALL),
+}
+
+
+def execute_tool(response_text: str, session: dict, iteration: int = 1) -> tuple[str, str, bool]:
+    """
+    Parse ACT: line from LLM response and execute the matching tool.
+    Returns (tool_name, observation, is_final).
+    On iteration 1, only load_skill_context() is allowed (progressive disclosure).
+    """
+    # Check final_answer first
+    match = TOOL_PATTERNS["final_answer"].search(response_text)
+    if match:
+        return "final_answer", match.group(1), True
+
+    # Check load_skill_context (progressive disclosure — loads method + knowledge)
+    match = TOOL_PATTERNS["load_skill_context"].search(response_text)
+    if match:
+        result = smk.load_skill_context(match.group(1))
+        session["skill_loaded"] = True
+        return "load_skill_context", f"OBSERVE:\n{result}", False
+
+    # Enforce progressive disclosure: first iteration MUST be load_skill_context
+    if iteration == 1 and not session.get("skill_loaded"):
+        available = ", ".join(s["name"] for s in smk.skills["skills"])
+        return "unknown", f"OBSERVE:\nERROR: You must call load_skill_context() first before any other tool. Pick the right skill and call: load_skill_context(skill_name). Available skills: {available}", False
+
+    match = TOOL_PATTERNS["get_current_datetime"].search(response_text)
+    if match:
+        result = TOOL_REGISTRY["get_current_datetime"]()
+        return "get_current_datetime", f"OBSERVE:\n{result}", False
+
+    match = TOOL_PATTERNS["login"].search(response_text)
+    if match:
+        email = match.group(1) if match.group(1) else None
+        password = match.group(2) if match.group(2) else None
+        result = TOOL_REGISTRY["login"](email, password)
+        try:
+            data = json.loads(result)
+            if "token" in data:
+                session["token"] = data["token"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return "login", f"OBSERVE:\n{result}", False
+
+    match = TOOL_PATTERNS["get_calendars"].search(response_text)
+    if match:
+        result = TOOL_REGISTRY["get_calendars"](match.group(1))
+        return "get_calendars", f"OBSERVE:\n{result}", False
+
+    match = TOOL_PATTERNS["get_events"].search(response_text)
+    if match:
+        result = TOOL_REGISTRY["get_events"](match.group(1))
+        return "get_events", f"OBSERVE:\n{result}", False
+
+    match = TOOL_PATTERNS["post_event"].search(response_text)
+    if match:
+        reminder = None
+        if match.group(7):
+            reminder = [int(x.strip()) for x in match.group(7).split(",") if x.strip()]
+        result = TOOL_REGISTRY["post_event"](
+            token=match.group(1),
+            calendar_id=match.group(2),
+            title=match.group(3),
+            start_time=match.group(4),
+            end_time=match.group(5),
+            description=match.group(6) or "",
+            reminder_minutes=reminder,
+        )
+        return "post_event", f"OBSERVE:\n{result}", False
+
+    match = TOOL_PATTERNS["patch_event"].search(response_text)
+    if match:
+        reminder = None
+        if match.group(7):
+            reminder = [int(x.strip()) for x in match.group(7).split(",") if x.strip()]
+        result = TOOL_REGISTRY["patch_event"](
+            token=match.group(1),
+            event_id=match.group(2),
+            title=match.group(3) or None,
+            start_time=match.group(4) or None,
+            end_time=match.group(5) or None,
+            description=match.group(6) or None,
+            reminder_minutes=reminder,
+        )
+        return "patch_event", f"OBSERVE:\n{result}", False
+
+    match = TOOL_PATTERNS["delete_event"].search(response_text)
+    if match:
+        result = TOOL_REGISTRY["delete_event"](match.group(1), match.group(2))
+        return "delete_event", f"OBSERVE:\n{result}", False
+
+    return "unknown", "ERROR: Invalid ACT format. Use one of: load_skill_context(), get_current_datetime(), login(), get_calendars(), get_events(), post_event(), patch_event(), delete_event(), final_answer()", False
+
+
+# ── LLM Call ──────────────────────────────────────────────────────────
+
+
+def call_llm(model: str, messages: list) -> str:
     message = anthropic_client.messages.create(
-        model=model, max_tokens=2048, messages=messages
+        model=model, max_tokens=2048, system=SYSTEM_PROMPT, messages=messages
     )
     return message.content[0].text
 
 
+# ── Endpoints ─────────────────────────────────────────────────────────
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "Calendar Agent API (SMK)"}
+
+
 @app.get("/models")
 async def list_models():
-    """List all available models from both providers"""
-    # Anthropic models (static list)
-    anthropic_models = [
-        {"name": m.value, "provider": "anthropic", "display_name": m.name.replace("_", " ").title()}
-        for m in AnthropicModel
-    ]
-
-    # Ollama models (dynamic from server)
-    ollama_raw = get_ollama_models()
-    ollama_models = [
-        {
-            "name": m["name"],
-            "provider": "ollama",
-            "display_name": m["name"],
-            "size": m.get("size"),
-            "modified_at": m.get("modified_at"),
-        }
-        for m in ollama_raw
-    ]
-
     return {
-        "providers": ["anthropic", "ollama"],
-        "default_provider": DEFAULT_PROVIDER.value,
-        "default_model": {
-            "anthropic": DEFAULT_ANTHROPIC_MODEL.value,
-            "ollama": DEFAULT_OLLAMA_MODEL,
-        },
-        "models": {
-            "anthropic": anthropic_models,
-            "ollama": ollama_models,
-        },
+        "default_model": DEFAULT_MODEL,
+        "models": [
+            {"name": "claude-3-5-sonnet-20241022", "provider": "anthropic"},
+            {"name": "claude-3-7-sonnet-20250219", "provider": "anthropic"},
+        ],
     }
 
 
-def get_observation_message(
-    iteration: int, response: str, session: dict
-) -> tuple[int, str, bool]:
-    """Process THINK/ACT response and execute tool calls"""
-    observation_message = None
-    is_final = False
-
-    # Regex patterns for tool calls
-    GET_DATETIME_REGEX = r'ACT:\s*get_current_datetime\(\)'
-    LOGIN_REGEX = r'ACT:\s*login\((?:email=["\'](.+?)["\']\s*,\s*password=["\'](.+?)["\']\s*)?\)'
-    GET_CALENDARS_REGEX = r'ACT:\s*get_calendars\(token=["\'](.+?)["\']\)'
-    GET_EVENTS_REGEX = r'ACT:\s*get_events\(token=["\'](.+?)["\']\)'
-    POST_EVENT_REGEX = r'ACT:\s*post_event\(token=["\'](.+?)["\']\s*,\s*calendar_id=["\'](.+?)["\']\s*,\s*title=["\'](.+?)["\']\s*,\s*start_time=["\'](.+?)["\']\s*,\s*end_time=["\'](.+?)["\']\s*,\s*description=["\'](.*)["\']\s*(?:,\s*reminder_minutes=\[([^\]]*)\])?\)'
-    PATCH_EVENT_REGEX = r'ACT:\s*patch_event\(token=["\'](.+?)["\']\s*,\s*event_id=["\'](.+?)["\']\s*(?:,\s*title=["\']([^"\']*)["\'])?\s*(?:,\s*start_time=["\']([^"\']*)["\'])?\s*(?:,\s*end_time=["\']([^"\']*)["\'])?\s*(?:,\s*description=["\']([^"\']*)["\'])?\s*(?:,\s*reminder_minutes=\[([^\]]*)\])?\)'
-    DELETE_EVENT_REGEX = r'ACT:\s*delete_event\(token=["\'](.+?)["\']\s*,\s*event_id=["\'](.+?)["\']\)'
-    FINAL_ANSWER_REGEX = r'ACT:\s*final_answer\((?:answer=)?["\'](.+?)["\']\)'
-
-    # Check for final_answer first
-    final_match = re.search(FINAL_ANSWER_REGEX, response, re.DOTALL)
-    if final_match:
-        answer = final_match.group(1)
-        observation_message = f"OBSERVE:\nTask completed successfully\n\nFinal Answer: {answer}"
-        is_final = True
-    else:
-        # Check for get_current_datetime
-        datetime_match = re.search(GET_DATETIME_REGEX, response, re.DOTALL)
-        if datetime_match:
-            now = datetime.now()
-            # Format: ISO 8601 with day name and readable format
-            iso_format = now.strftime("%Y-%m-%dT%H:%M:%S%z")
-            readable_format = now.strftime("%A, %B %d, %Y at %I:%M %p")
-            observation_message = f"OBSERVE:\nCurrent date and time: {iso_format}\n({readable_format})"
-        else:
-            # Check for login
-            login_match = re.search(LOGIN_REGEX, response, re.DOTALL)
-            if login_match:
-                email = login_match.group(1) if login_match.group(1) else "andrewbrowne161@gmail.com"
-                password = login_match.group(2) if login_match.group(2) else "Sierra-Ciara$"
-                try:
-                    result = requests.post(
-                        f"{CALENDAR_API_BASE}/api/auth/login/",
-                        json={"email": email, "password": password},
-                        headers={"Content-Type": "application/json"},
-                    )
-                    result.raise_for_status()
-                    response_data = result.json()
-                    if "access" in response_data:
-                        session["token"] = response_data["access"]
-                        observation_message = f'OBSERVE:\n{{"token": "{response_data["access"]}", "message": "Login successful"}}'
-                    else:
-                        observation_message = f"OBSERVE:\n{response_data}"
-                except requests.exceptions.RequestException as e:
-                    observation_message = f"ERROR: Login failed - {str(e)}"
-            else:
-                # Check for get_calendars
-                get_calendars_match = re.search(GET_CALENDARS_REGEX, response, re.DOTALL)
-                if get_calendars_match:
-                    token = get_calendars_match.group(1)
-                    try:
-                        result = requests.get(
-                            f"{CALENDAR_API_BASE}/api/calendars/",
-                            headers={
-                                "Authorization": f"Bearer {token}",
-                                "Content-Type": "application/json",
-                            },
-                        )
-                        result.raise_for_status()
-                        observation_message = f"OBSERVE:\n{json.dumps(result.json(), indent=2)}"
-                    except requests.exceptions.RequestException as e:
-                        observation_message = f"ERROR: Get calendars failed - {str(e)}"
-                else:
-                    # Check for get_events
-                    get_events_match = re.search(GET_EVENTS_REGEX, response, re.DOTALL)
-                    if get_events_match:
-                        token = get_events_match.group(1)
-                        try:
-                            result = requests.get(
-                                f"{CALENDAR_API_BASE}/api/events/",
-                                headers={
-                                    "Authorization": f"Bearer {token}",
-                                    "Content-Type": "application/json",
-                                },
-                            )
-                            result.raise_for_status()
-                            observation_message = f"OBSERVE:\n{json.dumps(result.json(), indent=2)}"
-                        except requests.exceptions.RequestException as e:
-                            observation_message = f"ERROR: Get events failed - {str(e)}"
-                    else:
-                        # Check for post_event
-                        post_event_match = re.search(POST_EVENT_REGEX, response, re.DOTALL)
-                        if post_event_match:
-                            token = post_event_match.group(1)
-                            calendar_id = post_event_match.group(2)
-                            title = post_event_match.group(3)
-                            start_time = post_event_match.group(4)
-                            end_time = post_event_match.group(5)
-                            description = post_event_match.group(6)
-                            reminder_minutes_str = post_event_match.group(7)
-                            try:
-                                event_data = {
-                                    "calendar": calendar_id,
-                                    "title": title,
-                                    "start_time": start_time,
-                                    "end_time": end_time,
-                                    "description": description,
-                                }
-                                # Parse reminder_minutes if provided
-                                if reminder_minutes_str:
-                                    reminder_minutes = [int(x.strip()) for x in reminder_minutes_str.split(",") if x.strip()]
-                                    event_data["reminder_minutes"] = reminder_minutes
-                                result = requests.post(
-                                    f"{CALENDAR_API_BASE}/api/events/",
-                                    json=event_data,
-                                    headers={
-                                        "Authorization": f"Bearer {token}",
-                                        "Content-Type": "application/json",
-                                    },
-                                )
-                                result.raise_for_status()
-                                response_data = result.json()
-                                observation_message = f"OBSERVE:\n{json.dumps(response_data, indent=2)}"
-                            except requests.exceptions.RequestException as e:
-                                observation_message = f"ERROR: Create event failed - {str(e)}"
-                        else:
-                            # Check for patch_event
-                            patch_event_match = re.search(PATCH_EVENT_REGEX, response, re.DOTALL)
-                            if patch_event_match:
-                                token = patch_event_match.group(1)
-                                event_id = patch_event_match.group(2)
-                                try:
-                                    updates = {}
-                                    if patch_event_match.group(3):
-                                        updates["title"] = patch_event_match.group(3)
-                                    if patch_event_match.group(4):
-                                        updates["start_time"] = patch_event_match.group(4)
-                                    if patch_event_match.group(5):
-                                        updates["end_time"] = patch_event_match.group(5)
-                                    if patch_event_match.group(6):
-                                        updates["description"] = patch_event_match.group(6)
-                                    if patch_event_match.group(7):
-                                        updates["reminder_minutes"] = [int(x.strip()) for x in patch_event_match.group(7).split(",") if x.strip()]
-
-                                    result = requests.patch(
-                                        f"{CALENDAR_API_BASE}/api/events/{event_id}/",
-                                        json=updates,
-                                        headers={
-                                            "Authorization": f"Bearer {token}",
-                                            "Content-Type": "application/json",
-                                        },
-                                    )
-                                    result.raise_for_status()
-                                    response_data = result.json()
-                                    observation_message = f"OBSERVE:\n{json.dumps(response_data, indent=2)}"
-                                except requests.exceptions.RequestException as e:
-                                    observation_message = f"ERROR: Update event failed - {str(e)}"
-                            else:
-                                # Check for delete_event
-                                delete_event_match = re.search(DELETE_EVENT_REGEX, response, re.DOTALL)
-                                if delete_event_match:
-                                    token = delete_event_match.group(1)
-                                    event_id = delete_event_match.group(2)
-                                    try:
-                                        result = requests.delete(
-                                            f"{CALENDAR_API_BASE}/api/events/{event_id}/",
-                                            headers={
-                                                "Authorization": f"Bearer {token}",
-                                            },
-                                        )
-                                        result.raise_for_status()
-                                        observation_message = f"OBSERVE:\nEvent {event_id} deleted successfully"
-                                    except requests.exceptions.RequestException as e:
-                                        observation_message = f"ERROR: Delete event failed - {str(e)}"
-                                else:
-                                    observation_message = "ERROR: Invalid ACT format. Please use get_current_datetime(), login(), get_calendars(), get_events(), post_event(), patch_event(), delete_event(), or final_answer()"
-
-    iteration += 1
-    return iteration, observation_message, is_final
-
-
-SYSTEM_PROMPT = """
-You are a meticulous calendar assistant that can manage events in a multi-step process using tool calls and reasoning.
-
-## Instructions:
-- You will use step-by-step reasoning by
-    - THINKING the next steps to take to complete the task and what next tool call to take to get one step closer to the final answer
-    - ACTING on the single next tool call to take
-- You will always respond with a single THINK/ACT message of the following format:
-    THINK:
-    [Carry out any reasoning needed to solve the problem not requiring a tool call]
-    [Conclusion about what next tool call to take based on what data is needed and what tools are available]
-    ACT:
-    [Tool to use and arguments]
-- As soon as you know the final answer, call the `final_answer` tool in an `ACT` message.
-- ALWAYS provide a tool call, after ACT:, else you will fail.
-
-## Available Tools
-
-* `get_current_datetime()`: Get the current date and time to help with relative date calculations (e.g., "tomorrow", "next week")
-* `login(email: str = "andrewbrowne161@gmail.com", password: str = "Sierra-Ciara$")`: Authenticate with the calendar API and get access token (credentials are optional, defaults provided)
-* `get_calendars(token: str)`: Retrieve all calendars for the authenticated user
-* `get_events(token: str)`: Retrieve all events for the authenticated user
-* `post_event(token: str, calendar_id: str, title: str, start_time: str, end_time: str, description: str, reminder_minutes: list[int] = [15])`: Create a new calendar event with optional reminders (array of minutes before event, e.g., [5, 15, 60] for 5min, 15min, and 1hr reminders)
-* `patch_event(token: str, event_id: str, title: str = "", start_time: str = "", end_time: str = "", description: str = "", reminder_minutes: list[int] = [])`: Update an existing event - only include fields you want to change
-* `delete_event(token: str, event_id: str)`: Delete an existing event
-* `final_answer(answer: str)`: Return the final answer to the user
-
-## Important Notes:
-- For datetime format, use ISO 8601 format: "YYYY-MM-DDTHH:MM:SSZ" (e.g., "2025-10-15T14:00:00Z")
-- When the user mentions relative dates like "tomorrow", "next week", etc., call get_current_datetime() first to calculate the correct date
-- You must login first to get a token before calling get_calendars, get_events, post_event, patch_event, or delete_event
-- After login, get the calendar ID using get_calendars before creating events
-- For patch_event, first get_events to find the event_id you want to update
-- Keep the token from login response to use in subsequent API calls
-- For reminders: use minutes (e.g., 15 = 15 minutes before, 60 = 1 hour before, 1440 = 1 day before)
-"""
-
-
-@app.post("/chat", response_model=CalendarResponse)
-async def chat(request: CalendarRequest):
-    """Chat with the calendar agent"""
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """Non-streaming chat — runs the full THINK/ACT/OBSERVE loop."""
     conversation_id = request.conversation_id or str(hash(request.message))
+    model = request.model or DEFAULT_MODEL
 
-    # Determine provider and model
-    provider = request.provider or DEFAULT_PROVIDER.value
-    if provider == "ollama":
-        model = request.model or DEFAULT_OLLAMA_MODEL
-    else:
-        model = request.model or DEFAULT_ANTHROPIC_MODEL.value
-
-    # Initialize or retrieve conversation
     if conversation_id not in conversations:
         conversations[conversation_id] = {
-            "messages": [{"role": "assistant", "content": SYSTEM_PROMPT}],
+            "messages": [],
             "session": {"token": None},
-            "provider": provider,
-            "model": model,
         }
 
     conv = conversations[conversation_id]
     messages = conv["messages"]
     session = conv["session"]
 
-    # Add credentials context if provided
     user_message = request.message
     if request.email and request.password:
         user_message = f"My credentials are: email={request.email}, password={request.password}. {user_message}"
-
     messages.append({"role": "user", "content": user_message})
 
-    # Agent loop
-    iteration = 1
+    iteration = 0
     max_iterations = 20
     final_response = ""
+    is_final = False
 
     while iteration < max_iterations:
+        iteration += 1
         try:
-            # Call the appropriate provider
-            if provider == "ollama":
-                assistant_message = call_ollama(model, messages, SYSTEM_PROMPT)
-            else:
-                assistant_message = call_anthropic(model, messages)
+            assistant_message = call_llm(model, messages)
             messages.append({"role": "assistant", "content": assistant_message})
 
-            # Get observation
-            iteration, obs, is_final = get_observation_message(
-                iteration, assistant_message, session
-            )
+            _, observation, is_final = execute_tool(assistant_message, session, iteration)
 
             if is_final:
-                # Extract final answer
-                final_match = re.search(
-                    r"Final Answer: (.+)", obs, re.DOTALL | re.IGNORECASE
-                )
-                if final_match:
-                    final_response = final_match.group(1).strip()
-                else:
-                    final_response = obs
+                final_response = observation
                 break
-            else:
-                # Continue with next tool call
-                messages.append({"role": "user", "content": obs})
+
+            messages.append({"role": "user", "content": observation})
 
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
 
-    return CalendarResponse(
+    return ChatResponse(
         response=final_response or "I wasn't able to complete the task.",
         conversation_id=conversation_id,
         completed=is_final,
@@ -436,114 +279,72 @@ async def chat(request: CalendarRequest):
 
 
 @app.post("/chat/stream")
-async def chat_stream(request: CalendarRequest):
-    """Chat with the calendar agent with streaming ReAct steps"""
+async def chat_stream(request: ChatRequest):
+    """Streaming chat — emits think/act/observe events via SSE."""
 
     async def generate():
         conversation_id = request.conversation_id or str(hash(request.message))
+        model = request.model or DEFAULT_MODEL
 
-        # Determine provider and model
-        provider = request.provider or DEFAULT_PROVIDER.value
-        if provider == "ollama":
-            model = request.model or DEFAULT_OLLAMA_MODEL
-        else:
-            model = request.model or DEFAULT_ANTHROPIC_MODEL.value
-
-        # Initialize or retrieve conversation
         if conversation_id not in conversations:
             conversations[conversation_id] = {
-                "messages": [{"role": "assistant", "content": SYSTEM_PROMPT}],
+                "messages": [],
                 "session": {"token": None},
-                "provider": provider,
-                "model": model,
             }
 
         conv = conversations[conversation_id]
         messages = conv["messages"]
         session = conv["session"]
 
-        # Add credentials context if provided
         user_message = request.message
         if request.email and request.password:
             user_message = f"My credentials are: email={request.email}, password={request.password}. {user_message}"
-
         messages.append({"role": "user", "content": user_message})
 
-        # Send start event with provider info
-        yield f"data: {json.dumps({'type': 'start', 'conversation_id': conversation_id, 'message': request.message, 'provider': provider, 'model': model})}\n\n"
+        yield f"data: {json.dumps({'type': 'start', 'conversation_id': conversation_id, 'message': request.message})}\n\n"
 
-        # Agent loop with streaming
-        iteration = 1
+        iteration = 0
         max_iterations = 20
         final_response = ""
+        is_final = False
 
         while iteration < max_iterations:
+            iteration += 1
             try:
-                # Call the appropriate provider
-                if provider == "ollama":
-                    assistant_message = call_ollama(model, messages, SYSTEM_PROMPT)
-                else:
-                    assistant_message = call_anthropic(model, messages)
+                assistant_message = call_llm(model, messages)
                 messages.append({"role": "assistant", "content": assistant_message})
 
-                # Parse and stream THINK/ACT components
+                # Stream THINK/ACT components
                 think_match = re.search(r'THINK:(.*?)(?=ACT:|$)', assistant_message, re.DOTALL)
                 act_match = re.search(r'ACT:(.*?)$', assistant_message, re.DOTALL)
 
                 if think_match:
-                    think_content = think_match.group(1).strip()
-                    yield f"data: {json.dumps({'type': 'think', 'content': think_content, 'iteration': iteration})}\n\n"
-
+                    yield f"data: {json.dumps({'type': 'think', 'content': think_match.group(1).strip(), 'iteration': iteration})}\n\n"
                 if act_match:
-                    act_content = act_match.group(1).strip()
-                    yield f"data: {json.dumps({'type': 'act', 'content': act_content, 'iteration': iteration})}\n\n"
+                    yield f"data: {json.dumps({'type': 'act', 'content': act_match.group(1).strip(), 'iteration': iteration})}\n\n"
 
-                # Get observation
-                iteration, obs, is_final = get_observation_message(
-                    iteration, assistant_message, session
-                )
-
-                # Stream observation
-                if obs:
-                    yield f"data: {json.dumps({'type': 'observe', 'content': obs, 'iteration': iteration})}\n\n"
+                tool_name, observation, is_final = execute_tool(assistant_message, session, iteration)
 
                 if is_final:
-                    # Extract final answer
-                    final_match = re.search(
-                        r"Final Answer: (.+)", obs, re.DOTALL | re.IGNORECASE
-                    )
-                    if final_match:
-                        final_response = final_match.group(1).strip()
-                    else:
-                        final_response = obs
-
-                    # Send complete event
+                    final_response = observation
                     yield f"data: {json.dumps({'type': 'complete', 'response': final_response, 'conversation_id': conversation_id, 'iterations': iteration})}\n\n"
                     break
-                else:
-                    # Continue with next tool call
-                    messages.append({"role": "user", "content": obs})
+
+                yield f"data: {json.dumps({'type': 'observe', 'tool': tool_name, 'content': observation, 'iteration': iteration})}\n\n"
+                messages.append({"role": "user", "content": observation})
 
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
                 break
 
         if not final_response:
-            error_msg = "I wasn't able to complete the task."
-            yield f"data: {json.dumps({'type': 'complete', 'response': error_msg, 'conversation_id': conversation_id, 'iterations': iteration})}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'response': 'I was not able to complete the task.', 'conversation_id': conversation_id, 'iterations': iteration})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-@app.get("/")
-async def root():
-    """Health check endpoint"""
-    return {"status": "ok", "service": "Calendar Agent API"}
-
-
 @app.delete("/conversation/{conversation_id}")
 async def delete_conversation(conversation_id: str):
-    """Delete a conversation"""
     if conversation_id in conversations:
         del conversations[conversation_id]
         return {"status": "deleted"}
@@ -552,5 +353,4 @@ async def delete_conversation(conversation_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=4012)

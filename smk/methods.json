@@ -1,0 +1,75 @@
+{
+  "model": "Method",
+  "methods": [
+    {
+      "name": "classify and execute calendar request",
+      "description": "Top-level method: figure out what the user wants, authenticate, then do it",
+      "steps": [
+        "Classify the user's intent (create/read/update/delete)",
+        "Authenticate if not already authenticated",
+        "Execute the appropriate subtask method",
+        "Return final answer to user"
+      ],
+      "failure_handling": {
+        "authentication fails": "Report auth failure to user, ask for credentials",
+        "execution fails": "Diagnose error, retry with corrected parameters",
+        "ambiguous request": "Ask user to clarify"
+      }
+    },
+    {
+      "name": "resolve details then post event",
+      "description": "Method for creating events — resolves relative dates, gets calendar ID, then posts",
+      "steps": [
+        "Get current datetime (needed for relative date resolution)",
+        "Get user's calendars to find calendar_id",
+        "Parse event details from user message (title, start, end, description, reminder)",
+        "Convert any relative dates to ISO 8601 using current datetime",
+        "Post event to Calendar API"
+      ],
+      "failure_handling": {
+        "missing required fields": "Ask user for the missing information",
+        "invalid datetime": "Re-parse with corrected format",
+        "API error": "Report error details to user"
+      }
+    },
+    {
+      "name": "find event then patch",
+      "description": "Method for updating events — finds the target event first, then patches",
+      "steps": [
+        "Get all events to find the one the user wants to modify",
+        "Match user's description to an event (by title, date, or ID)",
+        "Apply only the changes the user specified (don't overwrite other fields)",
+        "Confirm the update to the user"
+      ],
+      "failure_handling": {
+        "event not found": "Show user their events, ask which one they meant",
+        "multiple matches": "List matching events, ask user to pick one"
+      }
+    },
+    {
+      "name": "confirm then delete event",
+      "description": "Method for deleting events — finds the event, confirms with user if ambiguous",
+      "steps": [
+        "Get all events to find the target",
+        "If multiple matches, ask user to confirm which one",
+        "Delete the event",
+        "Confirm deletion to user"
+      ],
+      "failure_handling": {
+        "event not found": "Show user their events, ask which one they meant"
+      }
+    },
+    {
+      "name": "get and format events",
+      "description": "Method for reading events — retrieves and presents them clearly",
+      "steps": [
+        "Get all events from Calendar API",
+        "Format them in a readable way (date, time, title, description)",
+        "Present to user, organized chronologically"
+      ],
+      "failure_handling": {
+        "no events found": "Tell user they have no upcoming events"
+      }
+    }
+  ]
+}

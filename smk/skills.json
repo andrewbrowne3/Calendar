@@ -1,0 +1,75 @@
+{
+  "model": "Skill",
+  "skills": [
+    {
+      "name": "handle calendar request",
+      "description": "Understand and fulfill a user's natural language calendar request",
+      "inputs": "natural language message, user credentials",
+      "outputs": "final answer to user",
+      "precondition": "Calendar API available",
+      "postcondition": "user request fulfilled",
+      "method": "classify and execute calendar request",
+      "parent": null
+    },
+    {
+      "name": "authenticate user",
+      "description": "Log in to the Calendar API to get a JWT token",
+      "inputs": "email, password",
+      "outputs": "JWT token",
+      "precondition": "credentials available",
+      "postcondition": "valid token stored",
+      "method": "login to calendar API",
+      "parent": "handle calendar request"
+    },
+    {
+      "name": "create event",
+      "description": "Create a new calendar event with specified details",
+      "inputs": "token, calendar_id, title, start_time, end_time, description, reminder",
+      "outputs": "created event confirmation",
+      "precondition": "authenticated, calendar_id known, datetime parsed",
+      "postcondition": "event exists in calendar",
+      "method": "resolve details then post event",
+      "parent": "handle calendar request"
+    },
+    {
+      "name": "read events",
+      "description": "Retrieve and present calendar events to the user",
+      "inputs": "token",
+      "outputs": "formatted list of events",
+      "precondition": "authenticated",
+      "postcondition": "user sees their events",
+      "method": "get and format events",
+      "parent": "handle calendar request"
+    },
+    {
+      "name": "update event",
+      "description": "Modify an existing calendar event",
+      "inputs": "token, event_id, fields to change",
+      "outputs": "updated event confirmation",
+      "precondition": "authenticated, event_id known",
+      "postcondition": "event updated in calendar",
+      "method": "find event then patch",
+      "parent": "handle calendar request"
+    },
+    {
+      "name": "delete event",
+      "description": "Remove a calendar event",
+      "inputs": "token, event_id",
+      "outputs": "deletion confirmation",
+      "precondition": "authenticated, event_id known",
+      "postcondition": "event no longer exists",
+      "method": "confirm then delete event",
+      "parent": "handle calendar request"
+    },
+    {
+      "name": "resolve current datetime",
+      "description": "Get current date and time for relative date calculations like 'tomorrow' or 'next Friday'",
+      "inputs": "none",
+      "outputs": "current ISO 8601 datetime",
+      "precondition": "always true",
+      "postcondition": "datetime available for calculations",
+      "method": "call get_current_datetime tool",
+      "parent": null
+    }
+  ]
+}
