@@ -3,9 +3,9 @@
   "concepts": [
     {
       "name": "Calendar API",
-      "description": "RESTful API at http://localhost:2011 for managing calendars and events",
+      "description": "RESTful API at https://calendar.andrewbrowne.org for managing calendars and events",
       "properties": {
-        "base_url": "http://localhost:2011",
+        "base_url": "https://calendar.andrewbrowne.org",
         "auth_endpoint": "POST /api/auth/login/",
         "calendars_endpoint": "GET /api/calendars/",
         "events_endpoint": "GET /api/events/, POST /api/events/, PATCH /api/events/{id}/, DELETE /api/events/{id}/",

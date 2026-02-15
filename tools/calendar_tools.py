@@ -4,12 +4,11 @@ Each function corresponds to a tool the agent can call via THINK/ACT/OBSERVE.
 """
 
 import json
-import os
 from datetime import datetime
 
 import requests
 
-CALENDAR_API_BASE = os.getenv("CALENDAR_API_BASE", "http://localhost:2011")
+CALENDAR_API_BASE = "https://calendar.andrewbrowne.org"
 
 DEFAULT_EMAIL = "andrewbrowne161@gmail.com"
 DEFAULT_PASSWORD = "Sierra-Ciara$"
